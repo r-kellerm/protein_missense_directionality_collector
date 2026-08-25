@@ -67,6 +67,26 @@ except Exception:  # pragma: no cover
 
 DEP_MAP_MANIFEST_URL = "https://depmap.org/portal/api/download/files"
 ZENODO_RECORD_API = "https://zenodo.org/api/records/7689627"  # CancerMine v50 record; file discovery is dynamic.
+FIGSHARE_API_BASE = "https://api.figshare.com/v2"
+# DepMap moved some recent releases off Figshare, so this map intentionally contains
+# releases known to have public Figshare/ Figshare+ records. The portal manifest is
+# still used first in --download-source auto mode.
+FIGSHARE_RELEASE_ARTICLE_IDS = {
+    "24Q4": 27993248,
+    "DepMap Public 24Q4": 27993248,
+    "DepMap 24Q4 Public": 27993248,
+    "24Q2": 25880521,
+    "DepMap Public 24Q2": 25880521,
+    "DepMap 24Q2 Public": 25880521,
+}
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; depmap-directionality-table/0.3; +https://depmap.org/)",
+    "Accept": "text/csv,application/json,text/plain,*/*",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(REQUEST_HEADERS)
 
 TRUNCATING_TERMS = (
     "frameshift",
@@ -86,8 +106,6 @@ MISSENSE_TERMS = ("missense", "inframe", "protein_altering")
 
 BOOL_TRUE = {"true", "t", "1", "yes", "y"}
 BOOL_FALSE = {"false", "f", "0", "no", "n", "", "nan", "none"}
-
-AA_TOKEN_RE = r"(?:Ala|Arg|Asn|Asp|Cys|Gln|Glu|Gly|His|Ile|Leu|Lys|Met|Phe|Pro|Ser|Thr|Trp|Tyr|Val|[ACDEFGHIKLMNPQRSTVWY])"
 
 
 @dataclass
@@ -159,10 +177,107 @@ def fetch_manifest(workdir: Path, force: bool = False) -> pd.DataFrame:
         log(f"Using cached DepMap manifest: {out}")
         return pd.read_csv(out)
     log(f"Downloading DepMap file manifest from {DEP_MAP_MANIFEST_URL}")
-    r = requests.get(DEP_MAP_MANIFEST_URL, timeout=120)
+    r = SESSION.get(DEP_MAP_MANIFEST_URL, timeout=120)
+    if r.status_code == 403:
+        raise RuntimeError(
+            "DepMap portal manifest returned 403 Forbidden. This is usually portal-side bot/download protection. "
+            "Use --download-source figshare for a fully standalone public Figshare release, or pass local files."
+        )
     r.raise_for_status()
     out.write_bytes(r.content)
     return pd.read_csv(io.BytesIO(r.content))
+
+
+def release_to_figshare_article_id(release: Optional[str], article_id: Optional[int] = None) -> Tuple[str, int]:
+    if article_id is not None:
+        return (release or f"figshare_article_{article_id}"), int(article_id)
+    if release is None:
+        # Latest release known to be on Figshare/Figshare+ at the time this script was written.
+        return "DepMap Public 24Q4", FIGSHARE_RELEASE_ARTICLE_IDS["24Q4"]
+    rel = str(release).strip()
+    if rel in FIGSHARE_RELEASE_ARTICLE_IDS:
+        return rel, FIGSHARE_RELEASE_ARTICLE_IDS[rel]
+    m = re.search(r"(\d{2})\s*Q([1-4])", rel, flags=re.I)
+    if m:
+        key = f"{m.group(1)}Q{m.group(2)}"
+        if key in FIGSHARE_RELEASE_ARTICLE_IDS:
+            return rel, FIGSHARE_RELEASE_ARTICLE_IDS[key]
+    raise ValueError(
+        f"No built-in Figshare article id for release={release!r}. "
+        "Use --figshare-article-id with the numeric article id from the Figshare/Figshare+ URL, "
+        "or use --download-source portal if the DepMap portal manifest is reachable."
+    )
+
+
+def fetch_figshare_article(article_id: int, workdir: Path, force: bool = False) -> dict:
+    ensure_dir(workdir)
+    out = workdir / f"figshare_article_{article_id}.json"
+    if out.exists() and not force:
+        log(f"Using cached Figshare metadata: {out}")
+        return json.loads(out.read_text())
+    url = f"{FIGSHARE_API_BASE}/articles/{article_id}"
+    log(f"Downloading Figshare metadata from {url}")
+    r = SESSION.get(url, timeout=120)
+    r.raise_for_status()
+    out.write_text(r.text)
+    return r.json()
+
+
+def select_figshare_file(article: dict, filename: str) -> dict:
+    files = article.get("files", [])
+    if not files:
+        raise FileNotFoundError("Figshare article metadata contains no files.")
+    # Exact first, then case-insensitive, then substring; also allow .gz/.zip wrappers.
+    names = [(f, str(f.get("name", ""))) for f in files]
+    target = filename.lower()
+    for f, name in names:
+        if name == filename:
+            return f
+    for f, name in names:
+        if name.lower() == target:
+            return f
+    for f, name in names:
+        nl = name.lower()
+        if nl == target + ".gz" or nl == target + ".zip":
+            return f
+    for f, name in names:
+        if target in name.lower():
+            return f
+    available = [name for _, name in names[:50]]
+    raise FileNotFoundError(f"Could not find {filename!r} in Figshare article. First files: {available}")
+
+
+def download_from_figshare(
+    article: dict,
+    filename: str,
+    workdir: Path,
+    release: Optional[str] = None,
+    force: bool = False,
+) -> DownloadedFile:
+    f = select_figshare_file(article, filename)
+    real_name = str(f.get("name"))
+    rel = release or str(article.get("title", "figshare_release"))
+    safe_rel = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel or "figshare_release")
+    outdir = workdir / safe_rel
+    ensure_dir(outdir)
+    outpath = outdir / real_name
+    if outpath.exists() and outpath.stat().st_size > 0 and not force:
+        log(f"Using cached Figshare file: {outpath}")
+        return DownloadedFile(real_name, outpath, rel, f.get("download_url"))
+    url = f.get("download_url")
+    if not url:
+        fid = f.get("id")
+        if fid is None:
+            raise ValueError(f"Figshare file has neither download_url nor id: {f}")
+        url = f"https://figshare.com/ndownloader/files/{fid}"
+    log(f"Downloading {real_name} from Figshare [{rel}]")
+    with SESSION.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(outpath, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    return DownloadedFile(real_name, outpath, rel, url)
 
 
 def parse_release_key(release: str) -> Tuple[int, int]:
@@ -241,7 +356,7 @@ def download_from_manifest(
         return DownloadedFile(real_name, outpath, rel, str(row[url_col]))
     log(f"Downloading {real_name} [{rel}]")
     url = str(row[url_col])
-    with requests.get(url, stream=True, timeout=300) as r:
+    with SESSION.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
         with open(outpath, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -256,7 +371,7 @@ def download_cancermine_collated(workdir: Path, force: bool = False) -> Path:
         log(f"Using cached CancerMine: {out}")
         return out
     log("Discovering CancerMine collated TSV from Zenodo")
-    r = requests.get(ZENODO_RECORD_API, timeout=120)
+    r = SESSION.get(ZENODO_RECORD_API, timeout=120)
     r.raise_for_status()
     record = r.json()
     files = record.get("files", [])
@@ -269,7 +384,7 @@ def download_cancermine_collated(workdir: Path, force: bool = False) -> Path:
     if hit is None:
         raise FileNotFoundError("Could not find cancermine_collated.tsv in Zenodo record.")
     url = hit["links"]["self"]
-    rr = requests.get(url, timeout=300)
+    rr = SESSION.get(url, timeout=300)
     rr.raise_for_status()
     out.write_bytes(rr.content)
     return out
@@ -306,27 +421,13 @@ def first_existing_bool(df: pd.DataFrame, names: Sequence[str]) -> pd.Series:
     return as_bool_series(df[col])
 
 
-def matching_columns(df: pd.DataFrame, names: Sequence[str]) -> List[str]:
-    targets = {normalize_colname(name) for name in names}
-    exact = [col for col in df.columns if normalize_colname(col) in targets]
-    if exact:
-        return exact
-    # Conservative fallback for release-specific prefixes/suffixes.
-    return [
-        col for col in df.columns
-        if any(target and target in normalize_colname(col) for target in targets)
-    ]
-
-
 def contains_any(df: pd.DataFrame, names: Sequence[str], terms: Sequence[str]) -> pd.Series:
-    cols = matching_columns(df, names)
-    if not cols:
+    col = find_col(df, names)
+    if col is None:
         return pd.Series(False, index=df.index)
-    pattern = "|".join(re.escape(term) for term in terms)
-    result = pd.Series(False, index=df.index)
-    for col in cols:
-        result |= safe_str_series(df[col]).str.lower().str.contains(pattern, regex=True, na=False)
-    return result
+    pattern = "|".join(re.escape(t) for t in terms)
+    return safe_str_series(df[col]).str.lower().str.contains(pattern, regex=True, na=False)
+
 
 def derive_gene_role(mut: pd.DataFrame) -> pd.DataFrame:
     """Make row-level gene-role fields from DepMap row flags and optional CancerMine columns."""
@@ -360,26 +461,15 @@ def derive_directionality(mut: pd.DataFrame) -> pd.DataFrame:
     onc_hi = first_existing_bool(mut, ["OncogeneHighImpact", "Oncogene High Impact"])
     tsg_hi = first_existing_bool(mut, ["TumorSuppressorHighImpact", "Tumor Suppressor High Impact"])
 
+    vep_high = False
     vep_col = find_col(mut, ["VepImpact", "VEP_Impact", "IMPACT"])
-    vep_high = (
-        safe_str_series(mut[vep_col]).str.upper().eq("HIGH")
-        if vep_col is not None
-        else pd.Series(False, index=mut.index)
-    )
+    if vep_col is not None:
+        vep_high = safe_str_series(mut[vep_col]).str.upper().eq("HIGH")
+    else:
+        vep_high = pd.Series(False, index=mut.index)
 
-    consequence_cols = ["VariantInfo", "Consequence", "Variant_Classification"]
-    truncating = contains_any(mut, consequence_cols, TRUNCATING_TERMS)
-    missense = contains_any(mut, consequence_cols, ("missense", "nonsynonymous", "non-synonymous"))
-    inframe = contains_any(mut, consequence_cols, ("inframe", "in_frame"))
-
-    protein_col = find_col(mut, ["ProteinChange", "Protein_Change", "HGVSp_Short", "HGVSp"])
-    protein_text = safe_str_series(mut[protein_col]) if protein_col else pd.Series("", index=mut.index)
-    hgvsp_missense = protein_text.str.contains(
-        rf"(?:^|:)p\.\(?{AA_TOKEN_RE}\d+{AA_TOKEN_RE}\)?$",
-        regex=True,
-        na=False,
-    )
-    strict_missense = (missense | hgvsp_missense) & ~truncating & ~inframe
+    truncating = contains_any(mut, ["VariantInfo", "Consequence", "Variant_Classification"], TRUNCATING_TERMS)
+    missense = contains_any(mut, ["VariantInfo", "Consequence", "Variant_Classification"], MISSENSE_TERMS)
 
     mut["depmap_likely_lof_flag"] = likely_lof
     mut["depmap_vep_high_flag"] = vep_high
@@ -388,9 +478,9 @@ def derive_directionality(mut: pd.DataFrame) -> pd.DataFrame:
     mut["depmap_oncogene_high_impact_flag"] = onc_hi
     mut["depmap_tumor_suppressor_high_impact_flag"] = tsg_hi
     mut["variant_truncating_or_splice_flag"] = truncating
-    mut["variant_missense_flag"] = strict_missense
-    mut["variant_missense_or_inframe_flag"] = strict_missense | inframe
+    mut["variant_missense_or_inframe_flag"] = missense
 
+    # Conservative: only directly LOF-oriented DepMap flags.
     conservative_lof = likely_lof | tsg_hi | (vep_high & truncating)
     mut["directionality_label_conservative"] = np.where(conservative_lof, "lof", "unknown")
 
@@ -398,10 +488,11 @@ def derive_directionality(mut: pd.DataFrame) -> pd.DataFrame:
     is_onc = role.isin(["oncogene", "both"])
     is_tsg = role.isin(["tumor_suppressor", "both"])
 
+    # Heuristic hierarchy, ordered from most defensible to ambiguous.
     lof = conservative_lof | (is_tsg & truncating)
-    gof_like = (~lof) & is_onc & (hotspot | hess_driver) & (strict_missense | inframe | onc_hi)
+    gof_like = (~lof) & is_onc & (hotspot | hess_driver) & (missense | onc_hi)
     ambiguous = (
-        ((hotspot | hess_driver) & is_tsg & (strict_missense | inframe))
+        ((hotspot | hess_driver) & is_tsg & missense)
         | (lof & is_onc & (hotspot | onc_hi))
         | (onc_hi & tsg_hi)
     )
@@ -412,35 +503,36 @@ def derive_directionality(mut: pd.DataFrame) -> pd.DataFrame:
         default="unknown",
     )
 
-    evidence: List[str] = []
-    for idx in mut.index:
-        bits: List[str] = []
-        if bool(likely_lof.loc[idx]): bits.append("DepMap LikelyLoF")
-        if bool(tsg_hi.loc[idx]): bits.append("DepMap tumor-suppressor high-impact")
-        if bool(onc_hi.loc[idx]): bits.append("DepMap oncogene high-impact")
-        if bool(vep_high.loc[idx]): bits.append("VEP HIGH")
-        if bool(truncating.loc[idx]): bits.append("truncating/splice consequence")
-        if bool(strict_missense.loc[idx]): bits.append("missense consequence")
-        if bool(inframe.loc[idx]): bits.append("in-frame consequence")
-        if bool(hotspot.loc[idx]): bits.append("DepMap Hotspot")
-        if bool(hess_driver.loc[idx]): bits.append("HessDriver")
-        gene_role = role.loc[idx]
-        if gene_role != "unknown": bits.append(f"gene_role={gene_role}")
+    evidence = []
+    for i in mut.index:
+        bits = []
+        if bool(likely_lof.loc[i]):
+            bits.append("DepMap LikelyLoF")
+        if bool(tsg_hi.loc[i]):
+            bits.append("DepMap tumor-suppressor high-impact")
+        if bool(onc_hi.loc[i]):
+            bits.append("DepMap oncogene high-impact")
+        if bool(vep_high.loc[i]):
+            bits.append("VEP HIGH")
+        if bool(truncating.loc[i]):
+            bits.append("truncating/splice consequence")
+        if bool(hotspot.loc[i]):
+            bits.append("DepMap Hotspot")
+        if bool(hess_driver.loc[i]):
+            bits.append("HessDriver")
+        gr = role.loc[i]
+        if gr != "unknown":
+            bits.append(f"gene_role={gr}")
         evidence.append("; ".join(bits) if bits else "no direct directionality evidence")
     mut["directionality_evidence"] = evidence
 
-    final_label = mut["directionality_label_heuristic"]
     mut["directionality_confidence"] = np.select(
-        [
-            final_label.eq("ambiguous"),
-            final_label.eq("lof") & conservative_lof,
-            final_label.eq("gof_like") & hotspot & is_onc,
-            final_label.isin(["lof", "gof_like"]),
-        ],
-        ["low", "high", "medium", "low"],
-        default="none",
+        [mut["directionality_label_conservative"].eq("lof"), gof_like & hotspot & is_onc, ambiguous],
+        ["high", "medium", "low"],
+        default="low",
     )
     return mut
+
 
 def standardize_mutation_table(mut: pd.DataFrame, source_release: str) -> pd.DataFrame:
     mut = mut.copy()
@@ -461,25 +553,11 @@ def standardize_mutation_table(mut: pd.DataFrame, source_release: str) -> pd.Dat
     def get_or_empty(c: Optional[str]) -> pd.Series:
         return safe_str_series(mut[c]) if c is not None else pd.Series("", index=mut.index)
 
-    chrom_s, pos_s, ref_s, alt_s = get_or_empty(chrom), get_or_empty(pos), get_or_empty(ref), get_or_empty(alt)
-    protein_s, dna_s = get_or_empty(prot), get_or_empty(dna)
-    complete_genomic = chrom_s.ne("") & pos_s.ne("") & ref_s.ne("") & alt_s.ne("")
-    mut["variant_key"] = np.where(
-        complete_genomic,
-        chrom_s + ":" + pos_s + ":" + ref_s + ">" + alt_s,
-        "",
+    mut["variant_key"] = (
+        get_or_empty(chrom) + ":" + get_or_empty(pos) + ":" + get_or_empty(ref) + ">" + get_or_empty(alt)
     )
-    mut["protein_key"] = np.where(
-        mut["HugoSymbol"].ne("") & protein_s.ne(""),
-        mut["HugoSymbol"] + ":" + protein_s,
-        "",
-    )
-    mut["dna_key"] = np.where(
-        mut["HugoSymbol"].ne("") & dna_s.ne(""),
-        mut["HugoSymbol"] + ":" + dna_s,
-        "",
-    )
-    mut["has_valid_variant_identifier"] = mut[["variant_key", "protein_key", "dna_key"]].ne("").any(axis=1)
+    mut["protein_key"] = mut["HugoSymbol"] + ":" + get_or_empty(prot)
+    mut["dna_key"] = mut["HugoSymbol"] + ":" + get_or_empty(dna)
     if model is not None:
         mut["ModelID_standard"] = mut[model].astype(str)
     else:
@@ -548,13 +626,7 @@ def add_drug_response_support(
     max_candidates: int,
     fdr_threshold: float,
     min_effect_size: float,
-    match_lineage: bool = True,
 ) -> pd.DataFrame:
-    mut = mut.copy()
-    mut["directionality_label_with_drug_support"] = mut["directionality_label_heuristic"]
-    mut["drug_response_supports_gof"] = False
-    mut["drug_response_gof_confidence"] = "not_evaluated"
-    mut["drug_response_evidence"] = ""
     log("Loading drug-response matrix")
     drug = read_table(drug_matrix_path)
     mid = find_col(drug, ["ModelID", "DepMap_ID", "ModelConditionID", "CCLE_Name", "cell_line", "CellLine"], required=True)
@@ -628,13 +700,6 @@ def add_drug_response_support(
 
         mut_block = drug[drug["ModelID_standard"].isin(mutant_models)]
         wt_block = drug[drug["ModelID_standard"].isin(wt_models)]
-        if match_lineage and "model_lineage" in drug.columns:
-            mutant_lineages = set(mut_block["model_lineage"].dropna().astype(str).str.strip().str.lower())
-            mutant_lineages -= {"", "unknown", "nan", "none"}
-            if mutant_lineages:
-                wt_block = wt_block[
-                    wt_block["model_lineage"].astype(str).str.strip().str.lower().isin(mutant_lineages)
-                ]
         for dcol in matched_drugs:
             if dcol not in drug.columns:
                 continue
@@ -721,14 +786,14 @@ def add_drug_response_support(
         "no significant target-matched inhibitor support",
     )
 
-    # Keep one stable label vocabulary. Drug support is represented in separate
-    # fields and may promote an otherwise unknown oncogene variant to gof_like.
+    # Do not override LOF/ambiguous; create an additional integrated label.
+    mut["directionality_label_with_drug_support"] = mut["directionality_label_heuristic"]
     idx = (
         mut["directionality_label_heuristic"].eq("unknown")
         & mut["drug_response_supports_gof"]
         & mut["gene_role"].isin(["oncogene", "both"])
     )
-    mut.loc[idx, "directionality_label_with_drug_support"] = "gof_like"
+    mut.loc[idx, "directionality_label_with_drug_support"] = "gof_like_drug_supported"
     return mut
 
 
@@ -775,16 +840,14 @@ def maybe_auto_download_drug_files(manifest: pd.DataFrame, workdir: Path, releas
 
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--release", default=None, help="DepMap release name, e.g. 'DepMap Public 26Q1'. Default: latest DepMap Public release in manifest.")
+    ap.add_argument("--release", default=None, help="DepMap release name. With --download-source portal/auto this can be e.g. 'DepMap Public 26Q1'. With --download-source figshare, built-in releases include 24Q4 and 24Q2 unless --figshare-article-id is supplied.")
+    ap.add_argument("--download-source", choices=["auto", "portal", "figshare"], default="auto", help="Where to fetch DepMap files. auto tries the portal manifest first and falls back to Figshare if blocked.")
+    ap.add_argument("--figshare-article-id", type=int, default=None, help="Optional Figshare/Figshare+ numeric article id, e.g. 27993248 for DepMap 24Q4 Public.")
     ap.add_argument("--workdir", default="depmap_directionality_cache", help="Cache/download directory.")
     ap.add_argument("--out", required=True, help="Output parquet path.")
     ap.add_argument("--force-download", action="store_true", help="Re-download files even when cached.")
     ap.add_argument("--mutation-file", default=None, help="Optional local OmicsSomaticMutations.csv/maf path. If omitted, downloaded from DepMap manifest.")
-    ap.add_argument("--source-release", default=None, help="Provenance label for --mutation-file; default local_unspecified.")
-    ap.add_argument("--auto-model-download", action="store_true", help="With a local mutation file and no --model-file, still download Model.csv from the manifest.")
-    ap.add_argument("--missense-only", action="store_true", help="Keep only strict protein missense substitutions; recommended for missense LOF/GOF training.")
-    ap.add_argument("--keep-unidentified", action="store_true", help="Retain rows without a valid protein, cDNA, or genomic variant identifier.")
-    ap.add_argument("--model-file", default=None, help="Optional local Model.csv path for lineage metadata. Auto-download occurs for downloaded DepMap inputs or with --auto-model-download.")
+    ap.add_argument("--model-file", default=None, help="Optional local Model.csv path for lineage metadata. If omitted, script tries to download it.")
     ap.add_argument("--use-cancermine", action="store_true", help="Augment gene role with CancerMine collated gene roles.")
     ap.add_argument("--cancermine-file", default=None, help="Optional local cancermine_collated.tsv path.")
     ap.add_argument("--cancermine-min-citations", type=int, default=1, help="Minimum CancerMine citation count when citation column exists.")
@@ -797,35 +860,49 @@ def main() -> None:
     ap.add_argument("--max-drug-candidates", type=int, default=5000, help="Maximum protein-level variant candidates for drug association.")
     ap.add_argument("--drug-fdr-threshold", type=float, default=0.05, help="FDR threshold for drug support.")
     ap.add_argument("--drug-min-effect-size", type=float, default=0.0, help="Minimum sensitivity effect size; positive means mutant more sensitive.")
-    ap.add_argument("--drug-ignore-lineage", action="store_true", help="Do not restrict wild-type drug controls to lineages represented among mutant models.")
     args = ap.parse_args()
 
     workdir = Path(args.workdir)
     ensure_dir(workdir)
-    manifest: Optional[pd.DataFrame] = None
 
-    needs_manifest = (
-        not args.mutation_file
-        or args.auto_drug_download
-        or (args.auto_model_download and not args.model_file)
-    )
-    if needs_manifest:
-        manifest = fetch_manifest(workdir, force=args.force_download)
+    manifest = None
+    figshare_article = None
+    using_figshare = False
+
+    # If the user provides all required local files, do not touch the network for the DepMap manifest.
+    if args.mutation_file:
+        release = args.release or "local"
+        log(f"Using local mutation file; release label: {release}")
+    elif args.download_source == "figshare":
+        release, article_id = release_to_figshare_article_id(args.release, args.figshare_article_id)
+        figshare_article = fetch_figshare_article(article_id, workdir, force=args.force_download)
+        using_figshare = True
+        log(f"Using Figshare release: {release} [article_id={article_id}]")
+    else:
+        try:
+            manifest = fetch_manifest(workdir, force=args.force_download)
+            release = args.release or latest_depmap_public_release(manifest)
+            log(f"Using DepMap portal release: {release}")
+        except Exception as e:
+            if args.download_source == "portal":
+                raise
+            log(f"Portal manifest unavailable ({e}). Falling back to public Figshare release.")
+            release, article_id = release_to_figshare_article_id(args.release, args.figshare_article_id)
+            figshare_article = fetch_figshare_article(article_id, workdir, force=args.force_download)
+            using_figshare = True
+            log(f"Using Figshare release: {release} [article_id={article_id}]")
 
     if args.mutation_file:
         mut_path = Path(args.mutation_file)
-        if not mut_path.exists():
-            raise FileNotFoundError(mut_path)
-        release = args.release or args.source_release or "local_unspecified"
-        source_release = args.source_release or args.release or "local_unspecified"
+        source_release = release or "local"
+    elif using_figshare:
+        mut_dl = download_from_figshare(figshare_article, "OmicsSomaticMutations.csv", workdir, release=release, force=args.force_download)
+        mut_path = mut_dl.path
+        source_release = mut_dl.release or release
     else:
-        if manifest is None:
-            raise RuntimeError("DepMap manifest is required when --mutation-file is not supplied")
-        release = args.release or latest_depmap_public_release(manifest)
         mut_dl = download_from_manifest(manifest, "OmicsSomaticMutations.csv", workdir, release=release, force=args.force_download)
         mut_path = mut_dl.path
         source_release = mut_dl.release or release
-    log(f"Using source release: {source_release}")
 
     log(f"Loading mutation table: {mut_path}")
     mut = read_table(mut_path)
@@ -846,25 +923,25 @@ def main() -> None:
 
     mut = derive_gene_role(mut)
     mut = derive_directionality(mut)
-    if args.missense_only:
-        before = len(mut)
-        mut = mut.loc[mut["variant_missense_flag"]].copy()
-        log(f"Strict missense filter retained {len(mut):,} / {before:,} rows")
-    if not args.keep_unidentified:
-        before = len(mut)
-        mut = mut.loc[mut["has_valid_variant_identifier"]].copy()
-        if len(mut) != before:
-            log(f"Dropped {before - len(mut):,} rows without a valid variant identifier")
 
-    model_meta: Optional[pd.DataFrame] = None
-    if args.model_file or not args.mutation_file or args.auto_model_download:
-        model_meta = load_model_metadata(
-            Path(args.model_file) if args.model_file else None,
-            manifest=manifest,
-            workdir=workdir,
-            release=release,
-            force=args.force_download,
-        )
+    if args.model_file:
+        model_file_for_meta = Path(args.model_file)
+    elif using_figshare:
+        try:
+            model_file_for_meta = download_from_figshare(figshare_article, "Model.csv", workdir, release=release, force=args.force_download).path
+        except Exception as e:
+            log(f"Could not auto-download Model.csv from Figshare; continuing without lineage metadata. Reason: {e}")
+            model_file_for_meta = None
+    else:
+        model_file_for_meta = None
+
+    model_meta = load_model_metadata(
+        model_file_for_meta,
+        manifest=manifest,
+        workdir=workdir,
+        release=release,
+        force=args.force_download,
+    )
     if model_meta is not None:
         mut = mut.merge(model_meta, on="ModelID_standard", how="left")
 
@@ -872,10 +949,11 @@ def main() -> None:
     drug_meta = Path(args.drug_metadata) if args.drug_metadata else None
     if args.auto_drug_download and drug_matrix is None:
         if manifest is None:
-            manifest = fetch_manifest(workdir, force=args.force_download)
-        dm, dmeta = maybe_auto_download_drug_files(manifest, workdir, release=release, force=args.force_download)
-        drug_matrix = dm
-        drug_meta = drug_meta or dmeta
+            log("--auto-drug-download currently requires the DepMap portal manifest; skipping because the run is using Figshare/local files.")
+        else:
+            dm, dmeta = maybe_auto_download_drug_files(manifest, workdir, release=release, force=args.force_download)
+            drug_matrix = dm
+            drug_meta = drug_meta or dmeta
 
     if drug_matrix is not None:
         mut = add_drug_response_support(
@@ -889,7 +967,6 @@ def main() -> None:
             max_candidates=args.max_drug_candidates,
             fdr_threshold=args.drug_fdr_threshold,
             min_effect_size=args.drug_min_effect_size,
-            match_lineage=not args.drug_ignore_lineage,
         )
     else:
         mut["drug_response_supports_gof"] = False
@@ -917,7 +994,6 @@ def main() -> None:
         "depmap_oncogene_high_impact_flag",
         "depmap_tumor_suppressor_high_impact_flag",
         "variant_truncating_or_splice_flag",
-        "variant_missense_flag",
         "variant_missense_or_inframe_flag",
         "directionality_label_conservative",
         "directionality_label_heuristic",
@@ -952,3 +1028,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
