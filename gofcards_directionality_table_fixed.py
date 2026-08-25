@@ -90,6 +90,18 @@ DOWNLOAD_EXTENSIONS = (
     ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".zip", ".gz", ".bgz", ".tar.gz"
 )
 
+# Extensions that represent an actual table after decompression.
+# VCF is deliberately NOT included: the GoFCards site exposes example Trio/NonTrio
+# VCFs that are inputs to the web application, not the database export we want.
+TABULAR_EXTENSIONS = (".csv", ".tsv", ".txt", ".xlsx", ".xls", ".maf")
+
+# Known GoFCards database export observed on the official download host.
+# Automatic discovery remains as a fallback in case this endpoint changes again.
+KNOWN_DATA_URLS = [
+    "https://download.genemed.tech/upload/GainFunCards/gofcards_data_download.xlsx",
+    "http://download.genemed.tech/upload/GainFunCards/gofcards_data_download.xlsx",
+]
+
 MISSENSE_TERMS = (
     "missense", "nonsynonymous", "non-synonymous", "non synonymous",
     "protein_altering", "substitution", "snv", "snp"
@@ -252,21 +264,88 @@ def url_looks_downloadable(url: str) -> bool:
     )
 
 
+def candidate_is_obviously_not_database_export(url: str) -> bool:
+    """Reject GoFCards web-app inputs/examples that are not database exports."""
+    low = url.lower().split("?")[0]
+
+    # These are example input VCFs shipped by the site, not GoFCards records.
+    bad_tokens = (
+        "/example/",
+        "example_",
+        "nontrio",
+        "/trio/",
+        "_trio.",
+    )
+    if any(tok in low for tok in bad_tokens):
+        return True
+
+    # A VCF (possibly wrapped in gzip/zip) is an input/example file here, not the
+    # downloadable GoFCards annotation table.
+    if re.search(r"\.vcf(?:\.gz|\.bgz|\.zip)?$", low, flags=re.I):
+        return True
+
+    return False
+
+
 def score_candidate_url(url: str) -> int:
     low = url.lower()
     score = 0
+
+    # Strongly prefer the actual named GoFCards database export.
+    if "gofcards_data_download" in low:
+        score += 250
+    if "gainfuncards_data_download" in low:
+        score += 220
+
     for tok, val in [
-        ("gof", 5), ("variant", 5), ("snv", 3), ("missense", 3),
-        ("curated", 4), ("download", 4), ("data", 2), ("all", 1),
+        ("variant", 5), ("snv", 3), ("missense", 3),
+        ("curated", 4), ("download", 4), ("data", 5), ("all", 1),
         ("gene", -2), ("image", -5), ("slide", -5), ("logo", -5),
         ("css", -10), ("js", -2),
     ]:
         if tok in low:
             score += val
-    if any(low.split("?")[0].endswith(ext) for ext in DOWNLOAD_EXTENSIONS):
+
+    path = low.split("?")[0]
+    if path.endswith((".xlsx", ".xls")):
+        score += 30
+    elif path.endswith((".csv", ".tsv", ".txt")):
+        score += 25
+    elif path.endswith((".zip", ".gz", ".bgz", ".tar.gz")):
         score += 10
+
+    # Never allow example/input VCFs to win merely because they are downloadable.
+    if candidate_is_obviously_not_database_export(url):
+        score -= 1000
+
     return score
 
+
+def downloaded_path_contains_supported_table(path: Path) -> bool:
+    """Check that a downloaded candidate can yield a table this script can read."""
+    name = path.name.lower()
+
+    if name.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                members = [m.lower() for m in zf.namelist() if not m.endswith("/")]
+            return any(m.endswith(TABULAR_EXTENSIONS) for m in members)
+        except zipfile.BadZipFile:
+            return False
+
+    if name.endswith(".tar.gz"):
+        try:
+            with tarfile.open(path, mode="r:gz") as tf:
+                members = [m.name.lower() for m in tf.getmembers() if m.isfile()]
+            return any(m.endswith(TABULAR_EXTENSIONS) for m in members)
+        except tarfile.TarError:
+            return False
+
+    if name.endswith((".gz", ".bgz")):
+        # Exclude the site's example/input VCF streams.
+        return not re.search(r"\.vcf(?:\.gz|\.bgz)$", name, flags=re.I)
+
+    return name.endswith(TABULAR_EXTENSIONS)
 
 def discover_gofcards_download_urls(base_urls: Sequence[str], max_asset_fetches: int = 50) -> List[str]:
     session = make_session()
@@ -345,7 +424,12 @@ def discover_gofcards_download_urls(base_urls: Sequence[str], max_asset_fetches:
         for p in common_paths:
             candidate_downloads.append(urljoin(origin, p))
 
-    # Rank and de-duplicate.
+    # Rank and de-duplicate. Drop obvious GoFCards example/input VCFs here too.
+    candidate_downloads = [
+        u for u in candidate_downloads
+        if not candidate_is_obviously_not_database_export(u)
+    ]
+
     seen = set()
     ranked = []
     for u in sorted(candidate_downloads, key=score_candidate_url, reverse=True):
@@ -358,45 +442,76 @@ def discover_gofcards_download_urls(base_urls: Sequence[str], max_asset_fetches:
 def try_download_discovered(candidates: Sequence[str], outdir: Path, force: bool = False) -> Path:
     session = make_session()
     errors = []
+
+    # Rank again here so callers do not have to provide pre-sorted candidates.
+    candidates = sorted(dict.fromkeys(candidates), key=score_candidate_url, reverse=True)
+
     for url in candidates:
+        if candidate_is_obviously_not_database_export(url):
+            errors.append(f"{url}: skipped example/input VCF candidate")
+            continue
+
         try:
             resp = session.get(url, stream=True, timeout=120, allow_redirects=True)
             if resp.status_code >= 400:
                 errors.append(f"{url}: HTTP {resp.status_code}")
                 continue
+
             ctype = resp.headers.get("content-type", "").lower()
             first = next(resp.iter_content(chunk_size=4096), b"")
-            # Avoid saving HTML pages unless URL has a data extension.
+
+            # Avoid saving HTML pages unless the URL really looks like a data file.
             lower_url = resp.url.lower().split("?")[0]
             looks_file = any(lower_url.endswith(ext) for ext in DOWNLOAD_EXTENSIONS)
             if (b"<html" in first.lower() or "text/html" in ctype) and not looks_file:
                 errors.append(f"{url}: looked like HTML, not data")
                 continue
+
             name = sniff_filename_from_response(resp, resp.url)
             out = outdir / name
-            if out.exists() and out.stat().st_size > 0 and not force:
-                return out
             ensure_dir(outdir)
+
+            # A cached candidate is only reusable if it is actually a supported table/archive.
+            if out.exists() and out.stat().st_size > 0 and not force:
+                if downloaded_path_contains_supported_table(out):
+                    log(f"Using cached validated GoFCards data file: {out}")
+                    return out
+                errors.append(f"{url}: cached file did not contain a supported table")
+                continue
+
             with open(out, "wb") as f:
                 f.write(first)
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+
             if out.stat().st_size == 0:
                 errors.append(f"{url}: empty download")
                 continue
-            log(f"Downloaded discovered GoFCards data file: {out}")
+
+            if not downloaded_path_contains_supported_table(out):
+                errors.append(
+                    f"{url}: downloaded {out.name}, but it did not contain a supported "
+                    "CSV/TSV/TXT/XLS/XLSX/MAF table"
+                )
+                log(f"Skipping non-tabular GoFCards candidate: {out}")
+                continue
+
+            log(f"Downloaded validated GoFCards data file: {out}")
             return out
+
         except Exception as e:
             errors.append(f"{url}: {e}")
             continue
-    msg = "Could not automatically download a GoFCards data file.\n"
-    msg += "Tried candidate URLs such as:\n"
-    msg += "\n".join("  - " + e for e in errors[:30])
-    msg += "\n\nOpen the GoFCards Download page in a browser and pass the direct file URL with --download-url, "
-    msg += "or save the file locally and pass --input-file."
-    raise RuntimeError(msg)
 
+    msg = "Could not automatically download a usable GoFCards data file.\n"
+    msg += "Tried candidate URLs such as:\n"
+    msg += "\n".join("  - " + e for e in errors[:40])
+    msg += (
+        "\n\nOpen the GoFCards Download page in a browser and pass the direct database "
+        "file URL with --download-url, or save the database table locally and pass --input-file."
+    )
+    raise RuntimeError(msg)
 
 def decompress_if_needed(path: Path, workdir: Path) -> Path:
     ensure_dir(workdir)
@@ -423,7 +538,7 @@ def decompress_if_needed(path: Path, workdir: Path) -> Path:
             members = sorted(members, key=lambda m: score_candidate_url(m.name), reverse=True)
             for member in members:
                 low = member.name.lower()
-                if low.endswith(DOWNLOAD_EXTENSIONS) and not low.endswith((".zip", ".gz", ".bgz", ".tar.gz")):
+                if low.endswith(TABULAR_EXTENSIONS):
                     out = outdir / Path(member.name).name
                     if not out.exists() or out.stat().st_size == 0:
                         extracted = tf.extractfile(member)
@@ -437,7 +552,10 @@ def decompress_if_needed(path: Path, workdir: Path) -> Path:
                                     break
                                 fout.write(chunk)
                     return out
-        raise RuntimeError(f"Tar archive did not contain a recognized tabular data file: {path}")
+        raise RuntimeError(
+            f"Tar archive did not contain a recognized tabular data file: {path}. "
+            f"Members included: {[m.name for m in members[:20]]}"
+        )
 
     if name.endswith(".zip"):
         outdir = workdir / (path.stem + "_unzipped")
@@ -447,7 +565,7 @@ def decompress_if_needed(path: Path, workdir: Path) -> Path:
             members = sorted(members, key=lambda m: score_candidate_url(m), reverse=True)
             for member in members:
                 low = member.lower()
-                if low.endswith(DOWNLOAD_EXTENSIONS) and not low.endswith((".zip", ".gz", ".bgz", ".tar.gz")):
+                if low.endswith(TABULAR_EXTENSIONS):
                     out = outdir / Path(member).name
                     if not out.exists() or out.stat().st_size == 0:
                         log(f"Extracting {member} from {path}")
@@ -458,7 +576,10 @@ def decompress_if_needed(path: Path, workdir: Path) -> Path:
                                     break
                                 fout.write(chunk)
                     return out
-        raise RuntimeError(f"Zip file did not contain a recognized tabular data file: {path}")
+        raise RuntimeError(
+            f"Zip file did not contain a recognized tabular data file: {path}. "
+            f"Members included: {members[:20]}"
+        )
     return path
 
 def read_any_table(path: Path, sheet: Optional[str] = None) -> pd.DataFrame:
@@ -765,11 +886,26 @@ def main() -> None:
     elif args.download_url:
         data_path = download_url(args.download_url, workdir / "downloads", force=args.force_download)
     else:
-        base_urls = args.base_url or DEFAULT_BASE_URLS
-        log("Discovering GoFCards download URLs from website/assets")
-        candidates = discover_gofcards_download_urls(base_urls)
-        log(f"Discovered {len(candidates)} candidate URLs. Top candidates: {candidates[:10]}")
-        data_path = try_download_discovered(candidates, workdir / "downloads", force=args.force_download)
+        # First try the known official database export. This avoids crawling dozens of
+        # JavaScript assets and, crucially, avoids mistaking example VCF inputs for data.
+        try:
+            log("Trying known GoFCards database export URL(s)")
+            data_path = try_download_discovered(
+                KNOWN_DATA_URLS,
+                workdir / "downloads",
+                force=args.force_download,
+            )
+        except RuntimeError as known_err:
+            log(f"Known GoFCards export URL unavailable; falling back to web discovery: {known_err}")
+            base_urls = args.base_url or DEFAULT_BASE_URLS
+            log("Discovering GoFCards download URLs from website/assets")
+            candidates = discover_gofcards_download_urls(base_urls)
+            log(f"Discovered {len(candidates)} candidate URLs. Top candidates: {candidates[:10]}")
+            data_path = try_download_discovered(
+                candidates,
+                workdir / "downloads",
+                force=args.force_download,
+            )
 
     data_path = decompress_if_needed(Path(data_path), workdir / "extracted")
     raw = read_any_table(data_path, sheet=args.excel_sheet)
